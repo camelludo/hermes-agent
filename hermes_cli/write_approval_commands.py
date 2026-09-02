@@ -30,8 +30,16 @@ def _fmt_state(subsystem: str) -> str:
 # Formatting helpers
 # ---------------------------------------------------------------------------
 
-def _fmt_pending_list(subsystem: str) -> str:
+def _pending_records(subsystem: str, memory_store=None):
     records = wa.list_pending(subsystem)
+    if subsystem == wa.MEMORY:
+        scope_id = getattr(memory_store, "scope_id", None)
+        records = [r for r in records if r.get("payload", {}).get("scope_id") == scope_id]
+    return records
+
+
+def _fmt_pending_list(subsystem: str, memory_store=None) -> str:
+    records = _pending_records(subsystem, memory_store)
     if not records:
         return f"No pending {subsystem} writes."
     lines = [f"Pending {subsystem} writes ({len(records)}):"]
@@ -76,19 +84,19 @@ def handle_pending_subcommand(
     """
     if not args:
         # Bare /memory or /skills with no sub → show pending + gate state.
-        return f"{_fmt_state(subsystem)}\n\n" + _fmt_pending_list(subsystem)
+        return f"{_fmt_state(subsystem)}\n\n" + _fmt_pending_list(subsystem, memory_store)
 
     sub = args[0].lower()
     rest = args[1:]
 
     if sub == "pending":
-        return _fmt_pending_list(subsystem)
+        return _fmt_pending_list(subsystem, memory_store)
 
     if sub in {"approve", "apply"}:
         return _approve(subsystem, rest, memory_store)
 
     if sub in {"reject", "deny", "drop"}:
-        return _reject(subsystem, rest)
+        return _reject(subsystem, rest, memory_store)
 
     if sub == "diff" and subsystem == wa.SKILLS:
         return _diff(rest)
@@ -110,14 +118,14 @@ def _approve(subsystem: str, rest: List[str], memory_store) -> str:
     if err or target is None:
         return err or f"Usage: /{subsystem} approve <id>"
 
-    records = wa.list_pending(subsystem)
+    records = _pending_records(subsystem, memory_store)
     if not records:
         return f"No pending {subsystem} writes."
 
     if target.lower() == "all":
         targets = list(records)
     else:
-        rec = wa.get_pending(subsystem, target)
+        rec = next((r for r in records if r["id"] == target), None)
         if not rec:
             return f"No pending {subsystem} write with id '{target}'."
         targets = [rec]
@@ -155,17 +163,18 @@ def _apply_one(subsystem: str, rec, memory_store):
         return False, str(e)
 
 
-def _reject(subsystem: str, rest: List[str]) -> str:
+def _reject(subsystem: str, rest: List[str], memory_store=None) -> str:
     target, err = _resolve_one(subsystem, rest)
     if err or target is None:
         return err or f"Usage: /{subsystem} reject <id>"
     if target.lower() == "all":
         n = 0
-        for rec in wa.list_pending(subsystem):
+        for rec in _pending_records(subsystem, memory_store):
             if wa.discard_pending(subsystem, rec["id"]):
                 n += 1
         return f"Rejected {n} pending {subsystem} write(s)."
-    if wa.discard_pending(subsystem, target):
+    records = _pending_records(subsystem, memory_store)
+    if any(r["id"] == target for r in records) and wa.discard_pending(subsystem, target):
         return f"Rejected pending {subsystem} write '{target}'."
     return f"No pending {subsystem} write with id '{target}'."
 

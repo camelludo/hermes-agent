@@ -154,10 +154,15 @@ class HolographicMemoryProvider(MemoryProvider):
         ]
 
     def initialize(self, session_id: str, **kwargs) -> None:
+        from tools.memory_tool import get_memory_dir, resolve_memory_scope
+
+        scope_id = resolve_memory_scope(kwargs.get("gateway_session_key"))
         from hermes_constants import get_hermes_home
         _hermes_home = str(get_hermes_home())
         _default_db = _hermes_home + "/memory_store.db"
         db_path = self._config.get("db_path", _default_db)
+        if scope_id:
+            db_path = str(get_memory_dir() / "conversations" / scope_id / "memory_store.db")
         # Expand $HERMES_HOME in user-supplied paths so config values like
         # "$HERMES_HOME/memory_store.db" or "~/.hermes/memory_store.db" both
         # resolve to the active profile's directory.

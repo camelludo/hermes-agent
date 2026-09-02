@@ -21224,6 +21224,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     provider_data_collection=pr.get("data_collection"),
                     session_id=task_id,
                     platform=platform_key,
+                    gateway_session_key=self._session_key_for_source(source),
                     user_id=source.user_id,
                     user_id_alt=source.user_id_alt,
                     user_name=source.user_name,
