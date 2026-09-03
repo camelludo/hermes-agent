@@ -339,13 +339,8 @@ async def test_shutdown_notification_uses_persisted_origin_for_colon_ids():
 
 
 @pytest.mark.asyncio
-async def test_drain_suppress_skips_home_channel_keeps_session_ping(tmp_path, monkeypatch):
-    """A suppress_notification drain marker mutes ONLY the home-channel broadcast.
-
-    The per-active-session interrupt ping MUST still fire (it carries the
-    "your task was interrupted, message me to resume" hint). This is the core
-    drain-notification-suppression contract.
-    """
+async def test_drain_suppress_mutes_all_shutdown_lifecycle_notifications(tmp_path, monkeypatch):
+    """A flagged maintenance drain emits no shutdown lifecycle messages."""
     from gateway.config import HomeChannel, Platform
     import gateway.drain_control as dc
 
@@ -366,12 +361,5 @@ async def test_drain_suppress_skips_home_channel_keeps_session_ping(tmp_path, mo
 
     await runner._notify_active_sessions_of_shutdown()
 
-    # Exactly one send — the active-session ping to chat 999. The home-channel
-    # broadcast to home-42 was suppressed.
-    assert len(adapter.sent_calls) == 1
-    sent_chat_ids = {chat_id for chat_id, _content, _meta in adapter.sent_calls}
-    assert "999" in sent_chat_ids
-    assert "home-42" not in sent_chat_ids
-    assert "shutting down" in adapter.sent[0]
-
+    assert adapter.sent_calls == []
 
