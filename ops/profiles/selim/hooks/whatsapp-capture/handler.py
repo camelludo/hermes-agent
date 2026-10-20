@@ -13,6 +13,8 @@ import json
 import os
 import base64
 import re
+import threading
+import time
 import urllib.request
 from datetime import datetime, timezone
 
@@ -244,7 +246,7 @@ def _session_rows(session_id: str) -> tuple[list, list, dict] | None:
     """(inbound, outbound, new_watermark) since the last capture, or None.
 
     inbound  = [(row_id, epoch, text)]         from messages(role='user')
-    outbound = [(obligation_id, epoch, text)]  from delivery_obligations
+    outbound = [(obligation_id, epoch, text, chat_id)]  from delivery_obligations
     """
     import sqlite3
 
@@ -276,9 +278,9 @@ def _session_rows(session_id: str) -> tuple[list, list, dict] | None:
             outbound = []
             if session_key:
                 outbound = [
-                    (r[0], float(r[1] or 0), r[2] or "")
+                    (r[0], float(r[1] or 0), r[2] or "", r[3] or "")
                     for r in conn.execute(
-                        "SELECT obligation_id, created_at, content FROM delivery_obligations "
+                        "SELECT obligation_id, created_at, content, chat_id FROM delivery_obligations "
                         "WHERE session_key=? AND created_at>? ORDER BY created_at",
                         (session_key, last_out_ts),
                     )
@@ -298,32 +300,65 @@ def _session_rows(session_id: str) -> tuple[list, list, dict] | None:
     return inbound, outbound, new_mark
 
 
-def _delivery_status(timeout: float = 15.0) -> str | None:
-    """Did WhatsApp's server ack everything the bridge has sent? (#2463)
+# --------------------------------------------------------- delivery (#2463)
+# For 36h from 2026-10-17 every Selim reply was lost while being stored as
+# delivered: "sent" only meant the bridge's sendMessage resolved. A reply is
+# PROVIDER_ACCEPTED only once the bridge has sent something to that chat since
+# the reply was ledgered AND WhatsApp's server acked all of it. Until then it
+# is stored as UNKNOWN (the nightly self-check flags those), and a background
+# check upgrades the row when the ack lands.
+BRIDGE_URL = "http://127.0.0.1:3000"
+ACK_WAIT_SECONDS = 180.0  # past the bridge's 120s unacked-send alarm
+ACK_POLL_SECONDS = 5.0
 
-    The bridge's /health counts sends still waiting for a server ack. All
-    acked within the timeout = PROVIDER_ACCEPTED; still waiting = UNKNOWN.
-    A bridge without the counters (pre-ack-watch) = None, so the row is
-    stored as before. For 36h on 2026-10-17 every reply was lost while being
-    stored as delivered.
-    """
+
+def _acks_since(chat_id: str, since: float) -> dict | None:
+    """{'sent': n, 'acked': m} from the bridge's ack watch, or None when the
+    bridge can't tell (not running, or a build without /sends)."""
+    from urllib.parse import urlencode
+
+    query = urlencode({"chatId": chat_id, "since": f"{since:.3f}"})
+    try:
+        with urllib.request.urlopen(f"{BRIDGE_URL}/sends?{query}", timeout=3) as r:
+            data = json.load(r)
+        return {"sent": int(data["sent"]), "acked": int(data["acked"])}
+    except Exception:
+        return None
+
+
+def _accepted(acks: dict) -> bool:
+    return acks["sent"] > 0 and acks["acked"] == acks["sent"]
+
+
+def _confirm_later(args: dict, chat_id: str, since: float) -> None:
+    """Re-store the reply as PROVIDER_ACCEPTED once WhatsApp acks it; Stomaton
+    upgrades a row still marked UNKNOWN and changes nothing else."""
     import time
-    import urllib.request
 
-    deadline = time.time() + timeout
-    while True:
-        try:
-            with urllib.request.urlopen("http://127.0.0.1:3000/health", timeout=3) as r:
-                health = json.load(r)
-        except Exception:
-            return None
-        if "unackedSends" not in health:
-            return None
-        if health["unackedSends"] == 0:
-            return "PROVIDER_ACCEPTED"
-        if time.time() >= deadline:
-            return "UNKNOWN"
-        time.sleep(1.0)
+    deadline = time.time() + ACK_WAIT_SECONDS
+    while time.time() < deadline:
+        time.sleep(ACK_POLL_SECONDS)
+        acks = _acks_since(chat_id, since)
+        if acks is not None and _accepted(acks):
+            if _store_email({**args, "deliveryStatus": "PROVIDER_ACCEPTED"}):
+                print(f"[whatsapp-capture] OUT {args['whatsappMsgId']} acked by WhatsApp", flush=True)
+            return
+    print(
+        f"[whatsapp-capture] OUT {args['whatsappMsgId']} NOT acked by WhatsApp within "
+        f"{int(ACK_WAIT_SECONDS)}s; stays UNKNOWN",
+        flush=True,
+    )
+
+
+def _delivery_status(chat_id: str, since: float) -> str | None:
+    """PROVIDER_ACCEPTED, UNKNOWN, or None when the bridge doesn't track acks
+    (the row is then stored without a delivery status, as before)."""
+    if not chat_id:
+        return None
+    acks = _acks_since(chat_id, since)
+    if acks is None:
+        return None
+    return "PROVIDER_ACCEPTED" if _accepted(acks) else "UNKNOWN"
 
 
 def _iso(epoch: float) -> str:
@@ -464,7 +499,7 @@ async def handle(event_type: str, context: dict) -> None:
         print(f"[whatsapp-capture] store IN FAILED {wid} for {phone}", flush=True)
         return False
 
-    def _store_out(wid: str, text: str, when: str) -> bool:
+    def _store_out(wid: str, text: str, when: str, to_chat: str, since: float) -> bool:
         subj = f"Re: {text[:96].split(chr(10))[0]}"
         args = {
             "channel": "WHATSAPP",
@@ -482,11 +517,16 @@ async def handle(event_type: str, context: dict) -> None:
             "receivedAt": when,
             "scope": "PLATFORM",
         }
-        delivery = _delivery_status()
+        delivery = _delivery_status(to_chat, since)
         if delivery:
             args["deliveryStatus"] = delivery
         if _store_email(args):
             print(f"[whatsapp-capture] stored OUT {wid}: → {phone} ({delivery or 'delivery not tracked'})", flush=True)
+            if delivery == "UNKNOWN":
+                threading.Thread(
+                    target=_confirm_later, args=(args, to_chat, since), daemon=True,
+                    name=f"wa-capture-ack-{wid}",
+                ).start()
             return True
         print(f"[whatsapp-capture] store OUT FAILED {wid} for {phone}", flush=True)
         return False
@@ -506,8 +546,10 @@ async def handle(event_type: str, context: dict) -> None:
         stored = True
         for idx, (row_id, ts, text) in enumerate(inbound):
             stored = _store_in(f"wa-{session_id}-m{row_id}", text, _iso(ts), idx == len(inbound) - 1) and stored
-        for oid, ts, text in outbound:
-            stored = _store_out(f"wa-do-{oid}", text, _iso(ts)) and stored
+        for oid, ts, text, to_chat in outbound:
+            # The obligation is ledgered just BEFORE the send, so every send
+            # for this reply happens after `ts`.
+            stored = _store_out(f"wa-do-{oid}", text, _iso(ts), to_chat or chat_id, ts) and stored
         if (inbound or outbound) and stored:
             _save_watermark(new_mark)
         elif not inbound and not outbound:
@@ -519,4 +561,4 @@ async def handle(event_type: str, context: dict) -> None:
         _store_in(f"wa-{session_id}-{msg_hash:08x}", body_text, now, True)
     if response:
         out_hash = hash(f"{user_id}-out-{response}-{now[:16]}") & 0xFFFFFFFF
-        _store_out(f"wa-{session_id}-{out_hash:08x}-out", response, now)
+        _store_out(f"wa-{session_id}-{out_hash:08x}-out", response, now, chat_id or user_id, time.time() - 120)
